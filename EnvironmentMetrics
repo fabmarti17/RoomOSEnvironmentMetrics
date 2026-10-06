@@ -1,0 +1,279 @@
+import xapi from 'xapi';
+
+// --- Identifiers ---
+const PANEL_ID = 'environment_panel';
+const PAGE_ID  = 'environment_page';
+
+// --- Button colors based on presence ---
+const COLOR_OCCUPIED = '#D9272D'; // red   = room occupied
+const COLOR_FREE     = '#1A9D49'; // green = room free
+const COLOR_DEFAULT  = null;      // null  = no color (presence unknown)
+let currentPanelColor = null;
+
+// --- Thresholds ---
+const THRESHOLDS = {
+  temp:     { warn: 25, alert: 28 },    // °C
+  humidity: { warn: 60, alert: 70 },    // %
+  air:      { warn: 800, alert: 1200 }, // Air quality index
+  noise:    { warn: 50, alert: 65 },    // dB
+};
+
+const DOT = { ok: '🟢', warn: '🟡', alert: '🔴', na: '⚪' };
+const LABELS = { temp: 'Temperature', humidity: 'Humidity', air: 'Air quality', noise: 'Noise' };
+const UNITS  = { temp: '°C', humidity: '%', air: '', noise: 'dB' };
+
+let alertState = { temp: false, humidity: false, air: false, noise: false };
+let wasInAlert = false;
+let panelOpen = false;
+let realtimeSubs = [];
+let bgInterval = null;
+let navigatorId = null; // Navigator ID (environmental sensors on Room Series)
+
+// --- Navigator discovery (TouchPanel in Controller mode) ---
+async function findNavigatorId() {
+  try {
+    const res = await xapi.Status.Peripherals.ConnectedDevice.get();
+    const devices = Array.isArray(res) ? res : [res];
+    const nav = devices.find(d => d.Type === 'TouchPanel' && d.RoomAnalytics);
+    if (nav) {
+      console.log(`Navigator detected: id=${nav.id} (${nav.Name})`);
+      return nav.id;
+    }
+  } catch (e) {
+    console.warn('findNavigatorId:', e.message);
+  }
+  return null;
+}
+
+async function safeGet(path) {
+  try { return await path.get(); } catch (e) { return null; }
+}
+
+// Smart read: local sensor first, then Navigator
+async function readEnvSensor(localPath, navPathFn) {
+  let v = await safeGet(localPath);
+  if (v !== null && v !== undefined) return v;
+
+  if (!navigatorId) navigatorId = await findNavigatorId();
+  if (navigatorId) {
+    return await safeGet(navPathFn(navigatorId));
+  }
+  return null;
+}
+
+// --- Panel ---
+function buildPanelXml(color) {
+  const colorTag = color ? `<Color>${color}</Color>` : '';
+  return `
+<Extensions>
+  <Panel>
+    <Order>1</Order>
+    <PanelId>${PANEL_ID}</PanelId>
+    <Location>HomeScreenAndCallControls</Location>
+    <Icon>Sliders</Icon>
+    ${colorTag}
+    <Name>Room Environment</Name>
+    <ActivityType>Custom</ActivityType>
+    <Page>
+      <Name>Environment</Name>
+      <Row><Name>Presence</Name>
+        <Widget><WidgetId>env_presence</WidgetId><Type>Text</Type>
+          <Options>size=3;fontSize=normal;align=center</Options></Widget></Row>
+      <Row><Name>People Count</Name>
+        <Widget><WidgetId>env_people</WidgetId><Type>Text</Type>
+          <Options>size=3;fontSize=normal;align=center</Options></Widget></Row>
+      <Row><Name>Temperature</Name>
+        <Widget><WidgetId>env_temp</WidgetId><Type>Text</Type>
+          <Options>size=3;fontSize=normal;align=center</Options></Widget></Row>
+      <Row><Name>Humidity</Name>
+        <Widget><WidgetId>env_humidity</WidgetId><Type>Text</Type>
+          <Options>size=3;fontSize=normal;align=center</Options></Widget></Row>
+      <Row><Name>Air Quality</Name>
+        <Widget><WidgetId>env_air</WidgetId><Type>Text</Type>
+          <Options>size=3;fontSize=normal;align=center</Options></Widget></Row>
+      <Row><Name>Noise Level</Name>
+        <Widget><WidgetId>env_noise</WidgetId><Type>Text</Type>
+          <Options>size=3;fontSize=normal;align=center</Options></Widget></Row>
+      <PageId>${PAGE_ID}</PageId>
+      <Options>hideRowNames=0</Options>
+    </Page>
+  </Panel>
+</Extensions>`;
+}
+
+async function createPanel(color = COLOR_DEFAULT) {
+  try {
+    await xapi.Command.UserInterface.Extensions.Panel.Save(
+      { PanelId: PANEL_ID }, buildPanelXml(color)
+    );
+    currentPanelColor = color;
+    console.log(`Panel created/updated (color ${color || 'default'}).`);
+  } catch (e) {
+    console.error('Panel creation error:', e.message);
+  }
+}
+
+async function updatePanelColor(presence) {
+  let target = COLOR_DEFAULT;
+  if (presence === 'Yes')      target = COLOR_OCCUPIED;
+  else if (presence === 'No')  target = COLOR_FREE;
+  if (target !== currentPanelColor) await createPanel(target);
+}
+
+// --- Configurations (settings available on this build) ---
+async function applyConfigurations() {
+  const tasks = [
+    { name: 'PeopleCountOutOfCall',
+      fn: () => xapi.Config.RoomAnalytics.PeopleCountOutOfCall.set('On') },
+    { name: 'PeoplePresenceDetector',
+      fn: () => xapi.Config.RoomAnalytics.PeoplePresenceDetector.set('On') },
+    { name: 'AmbientNoiseEstimation.Mode',
+      fn: () => xapi.Config.RoomAnalytics.AmbientNoiseEstimation.Mode.set('On') },
+  ];
+  for (const t of tasks) {
+    try { await t.fn(); console.log(`Config OK: RoomAnalytics ${t.name}`); }
+    catch (e) { console.warn(`Config not applied (${t.name}): ${e.message}`); }
+  }
+}
+
+function statusDot(value, t) {
+  if (value === null) return DOT.na;
+  if (value >= t.alert) return DOT.alert;
+  if (value >= t.warn)  return DOT.warn;
+  return DOT.ok;
+}
+function isAlert(value, t) { return value !== null && value >= t.alert; }
+
+function showAlert(title, text, duration = 8) {
+  xapi.Command.UserInterface.Message.Alert.Display({ Title: title, Text: text, Duration: duration })
+    .catch(e => console.warn('Alert error:', e.message));
+}
+function setWidget(id, value) {
+  xapi.Command.UserInterface.Extensions.Widget.SetValue({ WidgetId: id, Value: value })
+    .catch(e => console.warn(`Widget ${id}:`, e.message));
+}
+
+function presenceLabel(presence) {
+  if (presence === 'Yes') return '🔴 Occupied';
+  if (presence === 'No')  return '🟢 Free';
+  return `${DOT.na} N/A`;
+}
+
+// --- Environmental readings (local OR Navigator) ---
+async function readTemp() {
+  return readEnvSensor(
+    xapi.Status.RoomAnalytics.AmbientTemperature,
+    (id) => xapi.Status.Peripherals.ConnectedDevice[id].RoomAnalytics.AmbientTemperature
+  );
+}
+async function readHum() {
+  return readEnvSensor(
+    xapi.Status.RoomAnalytics.RelativeHumidity,
+    (id) => xapi.Status.Peripherals.ConnectedDevice[id].RoomAnalytics.RelativeHumidity
+  );
+}
+async function readAir() {
+  return readEnvSensor(
+    xapi.Status.RoomAnalytics.AirQuality.Index,
+    (id) => xapi.Status.Peripherals.ConnectedDevice[id].RoomAnalytics.AirQuality.Index
+  );
+}
+
+// --- Lightweight update (real time: presence + people count + noise) ---
+async function updateLiveSensors() {
+  const presence = await safeGet(xapi.Status.RoomAnalytics.PeoplePresence);
+  const ppl      = await safeGet(xapi.Status.RoomAnalytics.PeopleCount.Current);
+  const noise    = await safeGet(xapi.Status.RoomAnalytics.AmbientNoise.Level.A);
+  const nNoise   = noise !== null ? parseFloat(noise) : null;
+
+  await updatePanelColor(presence);
+
+  setWidget('env_presence', presenceLabel(presence));
+  setWidget('env_people', ppl !== null ? `👥 ${ppl}` : `${DOT.na} N/A`);
+  setWidget('env_noise', noise !== null ? `${statusDot(nNoise, THRESHOLDS.noise)} ${noise} dB` : `${DOT.na} N/A`);
+
+  const inAlert = isAlert(nNoise, THRESHOLDS.noise);
+  if (inAlert && !alertState.noise) showAlert('⚠️ Environment alert', `${LABELS.noise}: ${noise} dB`, 10);
+  alertState.noise = inAlert;
+}
+
+// --- Full update (all sensors) ---
+async function updateEnvironment() {
+  const presence = await safeGet(xapi.Status.RoomAnalytics.PeoplePresence);
+  const ppl      = await safeGet(xapi.Status.RoomAnalytics.PeopleCount.Current);
+  const noise    = await safeGet(xapi.Status.RoomAnalytics.AmbientNoise.Level.A);
+  const temp     = await readTemp();
+  const hum      = await readHum();
+  const air      = await readAir();
+
+  const nTemp  = temp  !== null ? parseFloat(temp)  : null;
+  const nHum   = hum   !== null ? parseFloat(hum)   : null;
+  const nAir   = air   !== null ? parseFloat(air)   : null;
+  const nNoise = noise !== null ? parseFloat(noise) : null;
+
+  await updatePanelColor(presence);
+
+  setWidget('env_presence', presenceLabel(presence));
+  setWidget('env_people',   ppl   !== null ? `👥 ${ppl}`                                           : `${DOT.na} N/A`);
+  setWidget('env_temp',     temp  !== null ? `${statusDot(nTemp, THRESHOLDS.temp)} ${temp} °C`     : `${DOT.na} N/A`);
+  setWidget('env_humidity', hum   !== null ? `${statusDot(nHum, THRESHOLDS.humidity)} ${hum} %`     : `${DOT.na} N/A`);
+  setWidget('env_air',      air   !== null ? `${statusDot(nAir, THRESHOLDS.air)} ${air}`            : `${DOT.na} N/A`);
+  setWidget('env_noise',    noise !== null ? `${statusDot(nNoise, THRESHOLDS.noise)} ${noise} dB`   : `${DOT.na} N/A`);
+
+  const readings = { temp: nTemp, humidity: nHum, air: nAir, noise: nNoise };
+  const newAlerts = [];
+  for (const key of Object.keys(THRESHOLDS)) {
+    const a = isAlert(readings[key], THRESHOLDS[key]);
+    if (a && !alertState[key]) newAlerts.push(`${LABELS[key]}: ${readings[key]} ${UNITS[key]}`.trim());
+    alertState[key] = a;
+  }
+  if (newAlerts.length > 0) showAlert('⚠️ Environment alert', newAlerts.join('  |  '), 10);
+
+  const anyAlert = Object.values(alertState).some(v => v === true);
+  if (!anyAlert && wasInAlert) showAlert('✅ Environment', 'All parameters are back to normal.', 5);
+  wasInAlert = anyAlert;
+}
+
+// --- Real time while the panel is open (status subscriptions) ---
+async function startRealtime() {
+  if (panelOpen) return;
+  panelOpen = true;
+  console.log('Panel opened → real-time mode enabled.');
+  realtimeSubs.push(xapi.Status.RoomAnalytics.PeoplePresence.on(() => updateLiveSensors()));
+  realtimeSubs.push(xapi.Status.RoomAnalytics.PeopleCount.Current.on(() => updateLiveSensors()));
+  realtimeSubs.push(xapi.Status.RoomAnalytics.AmbientNoise.Level.A.on(() => updateLiveSensors()));
+  updateEnvironment();
+}
+async function stopRealtime() {
+  if (!panelOpen) return;
+  panelOpen = false;
+  console.log('Panel closed → idle mode.');
+  realtimeSubs.forEach(unsub => { try { unsub(); } catch (e) {} });
+  realtimeSubs = [];
+}
+
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// --- Init ---
+async function init() {
+  await createPanel(COLOR_DEFAULT);
+  await applyConfigurations();
+  navigatorId = await findNavigatorId();
+  console.log('Initializing sensors… (10 s)');
+  await delay(10000);
+  await updateEnvironment();
+
+  bgInterval = setInterval(updateEnvironment, 30000); // background refresh
+
+  xapi.Event.UserInterface.Extensions.Event.PageOpened.on((e) => {
+    if (e.PageId === PAGE_ID) startRealtime();
+  });
+  xapi.Event.UserInterface.Extensions.Event.PageClosed.on((e) => {
+    if (e.PageId === PAGE_ID) stopRealtime();
+  });
+  xapi.Event.UserInterface.Extensions.Panel.Clicked.on((e) => {
+    if (e.PanelId === PANEL_ID) updateEnvironment();
+  });
+}
+
+init();
